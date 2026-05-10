@@ -1,10 +1,10 @@
 import os
 import io
+import requests
 from fastapi import FastAPI, UploadFile, File, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from PyPDF2 import PdfReader
-from openai import OpenAI
 from dotenv import load_dotenv
 
 # Load environment variables from .env file
@@ -21,30 +21,45 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Initialize OpenAI Client (Requires OPENAI_API_KEY in .env)
-client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+HF_API_KEY = os.getenv("HUGGINGFACE_API_KEY")
+# Using Facebook's BART model which is excellent for summarization and free on the Inference API
+HF_API_URL = "https://api-inference.huggingface.co/models/facebook/bart-large-cnn"
 
 class SummarizeRequest(BaseModel):
     text: str
 
 def generate_summary(text: str) -> str:
-    """Helper function to call OpenAI API for summarization."""
-    if not os.getenv("OPENAI_API_KEY"):
-        return "Error: OPENAI_API_KEY is not set in the environment variables. Please add it to your .env file."
+    """Helper function to call Hugging Face API for summarization."""
+    if not HF_API_KEY:
+        return "Error: HUGGINGFACE_API_KEY is not set in the environment variables. Please add it to your .env file."
         
+    headers = {"Authorization": f"Bearer {HF_API_KEY}"}
+    payload = {
+        "inputs": text,
+        "parameters": {"max_length": 250, "min_length": 50, "do_sample": False}
+    }
+    
     try:
-        response = client.chat.completions.create(
-            model="gpt-3.5-turbo",
-            messages=[
-                {"role": "system", "content": "You are a highly capable AI assistant that summarizes text concisely. Keep the summary structured and easy to read."},
-                {"role": "user", "content": f"Please summarize the following text:\n\n{text}"}
-            ],
-            max_tokens=500,
-            temperature=0.5
-        )
-        return response.choices[0].message.content
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"OpenAI API Error: {str(e)}")
+        response = requests.post(HF_API_URL, headers=headers, json=payload)
+        
+        # Check if the model is still loading (Status 503)
+        if response.status_code == 503:
+            raise HTTPException(
+                status_code=503, 
+                detail="The Hugging Face model is currently loading into memory. Please wait about 30 seconds and try again."
+            )
+            
+        response.raise_for_status()
+        result = response.json()
+        
+        # Hugging Face returns a list with a dictionary containing 'summary_text'
+        if isinstance(result, list) and len(result) > 0 and "summary_text" in result[0]:
+            return result[0]["summary_text"]
+        else:
+            return f"Unexpected response format from Hugging Face: {result}"
+            
+    except requests.exceptions.RequestException as e:
+        raise HTTPException(status_code=500, detail=f"Hugging Face API Error: {str(e)}")
 
 @app.get("/")
 def read_root():
@@ -78,10 +93,10 @@ async def summarize_pdf(file: UploadFile = File(...)):
         if not extracted_text.strip():
             raise HTTPException(status_code=400, detail="Could not extract text from the PDF. It might be scanned or empty.")
             
-        # Truncate text if it's too long (Basic handling to avoid exceeding token limits)
-        max_chars = 12000 # Roughly 3000-4000 tokens
+        # Truncate text if it's too long (BART model limit is roughly 1024 tokens ~ 4000 characters)
+        max_chars = 4000
         if len(extracted_text) > max_chars:
-            extracted_text = extracted_text[:max_chars] + "\n...[Text truncated due to length limitations]"
+            extracted_text = extracted_text[:max_chars]
             
         summary = generate_summary(extracted_text)
         
@@ -90,4 +105,7 @@ async def summarize_pdf(file: UploadFile = File(...)):
             "extracted_words": len(extracted_text.split())
         }
     except Exception as e:
+        # Avoid overriding Hugging Face 503 errors
+        if isinstance(e, HTTPException):
+            raise e
         raise HTTPException(status_code=500, detail=f"Failed to process PDF: {str(e)}")
